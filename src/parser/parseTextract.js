@@ -24,6 +24,6 @@ export function parseTextractResponse(raw) {
     return Object.values(pages);
   }
 
-  // Tesseract fallback shape
-  return raw; // already standardized
+  
+  return raw; 
 }
