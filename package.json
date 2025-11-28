@@ -1,0 +1,25 @@
+{
+  "name": "invoice-extractor",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "aws-sdk": "^2.1360.0",
+    "axios": "^1.6.0",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "fast-levenshtein": "^2.0.6",
+    "mongodb": "^5.7.0",
+    "sharp": "^0.32.1",
+    "tesseract.js": "^4.1.1",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}
