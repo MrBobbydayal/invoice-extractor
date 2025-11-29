@@ -4,15 +4,17 @@ import dotenv from "dotenv";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
+import sharp from "sharp";
+import { convertPdfToPng } from "./src/services/pdfService.js";
+import { downloadFile } from "./src/services/fileService.js";
 
 import { connectDB } from "./src/config/db.js";
-import { downloadFile } from "./src/services/fileService.js";
 import { ocrFromImage } from "./src/ocr/tesseractFallback.js";
 import { extractJsonFromOcr } from "./src/parser/llmExtractor.js";
 
 dotenv.config();
 
-
+// Windows path fix
 let __dirname = path.dirname(decodeURI(new URL(import.meta.url).pathname));
 if (process.platform === "win32" && __dirname.startsWith("/")) {
   __dirname = __dirname.slice(1);
@@ -23,39 +25,51 @@ app.use(bodyParser.json({ limit: "15mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// Mongo client
+// DB connection
 let db;
 connectDB()
   .then((client) => {
     db = client.db(process.env.DB_NAME || "invoice_extractor");
     console.log("MongoDB connected");
   })
-  .catch((err) => {
-    console.error("MongoDB connection failed", err);
-  });
+  .catch((err) => console.error("MongoDB connection failed", err));
 
-  //route
+/************************ MAIN ROUTE *************************/
 app.post("/extract-bill-data", async (req, res) => {
   try {
     const { document } = req.body;
-    if (!document) return res.status(400).json({ error: "document URL required" });
+    if (!document) {
+      return res.status(400).json({ error: "document URL required" });
+    }
 
     if (!db) {
-      return res
-        .status(500)
-        .json({ is_success: false, error: "DB not connected yet. Try again." });
+      return res.status(500).json({
+        is_success: false,
+        error: "DB not connected yet. Try again.",
+      });
     }
 
     const jobId = uuidv4();
     const tmpDir = path.join(__dirname, "tmp");
 
-    
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-    const tmpFile = path.join(tmpDir, `${jobId}.png`);
+    // Base temporary path (extension added by service)
+    const baseTempPath = path.join(tmpDir, jobId);
+
+    /***** Step 1: Download file (Auto detect: PDF / Image) ******/
+    const { filePath: downloadedFile, ext } = await downloadFile(
+      document,
+      baseTempPath
+    );
+
+    const isPdf = ext === ".pdf";
+
+    let finalImagePath = "";
+
+    /**************** DB JOB ENTRY ******************/
     const invoices = db.collection("invoices");
 
-    
     const job = {
       job_id: jobId,
       input_url: document,
@@ -64,60 +78,97 @@ app.post("/extract-bill-data", async (req, res) => {
     };
     const inserted = await invoices.insertOne(job);
 
-    // download invoice
-    await downloadFile(document, tmpFile);
+    /**************** STEP 2: Convert PDF → PNG or Normalize Image ******************/
+    if (isPdf) {
+      console.log("PDF detected → converting to PNG...");
+      finalImagePath = await convertPdfToPng(downloadedFile);
+    } else {
+      console.log("Image detected → normalizing to PNG...");
 
-    // ---- OCR step (Tesseract) ----
+      // Save as different PNG file to avoid same input/output
+      const tempPng = baseTempPath + "_converted.png";
+
+      await sharp(downloadedFile).png().toFile(tempPng);
+
+      finalImagePath = tempPng;
+    }
+
+    /**************** STEP 3: OCR ******************/
     let ocrText;
     try {
-      ocrText = await ocrFromImage(tmpFile);
+      ocrText = await ocrFromImage(finalImagePath);
     } catch (err) {
       console.error("OCR failed:", err);
+
       await invoices.updateOne(
         { _id: inserted.insertedId },
-        { $set: { status: "error", error: "OCR failed", updated_at: new Date() } }
+        {
+          $set: {
+            status: "error",
+            error: "OCR failed",
+            updated_at: new Date(),
+          },
+        }
       );
-      fs.unlinkSync(tmpFile);
+
       return res.status(500).json({ is_success: false, error: "OCR failed" });
     }
 
-    // store raw OCR text
     await invoices.updateOne(
       { _id: inserted.insertedId },
       { $set: { raw_ocr_text: ocrText } }
     );
 
-    // ---- LLM extraction step (structured JSON) ----
+    /**************** STEP 4: LLM JSON parsing ******************/
     let finalParsed;
     try {
       finalParsed = await extractJsonFromOcr(ocrText);
     } catch (err) {
       console.error("LLM extractor failed:", err);
+
       await invoices.updateOne(
         { _id: inserted.insertedId },
-        { $set: { status: "error", error: "LLM extraction failed", updated_at: new Date() } }
+        {
+          $set: {
+            status: "error",
+            error: "LLM extraction failed",
+            updated_at: new Date(),
+          },
+        }
       );
-      fs.unlinkSync(tmpFile);
-      return res.status(500).json({ is_success: false, error: "LLM extraction failed" });
+
+      return res.status(500).json({
+        is_success: false,
+        error: "LLM extraction failed",
+      });
     }
 
-    // update DB
+    /**************** STEP 5: Save Result ******************/
     await invoices.updateOne(
       { _id: inserted.insertedId },
-      { $set: { ...finalParsed, status: "done", updated_at: new Date() } }
+      {
+        $set: {
+          ...finalParsed,
+          status: "done",
+          updated_at: new Date(),
+        },
+      }
     );
 
-    // clean up local file
+    /**************** CLEANUP ******************/
     try {
-      fs.unlinkSync(tmpFile);
-    } catch (e) {
-      // ignore
-    }
+      if (fs.existsSync(downloadedFile)) fs.unlinkSync(downloadedFile);
+      if (fs.existsSync(finalImagePath)) fs.unlinkSync(finalImagePath);
+    } catch {}
 
-    // final API response
+    /**************** FINAL RESPONSE ******************/
     return res.json({
       is_success: true,
-      token_usage: finalParsed.token_usage || { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
+      token_usage: finalParsed.token_usage || {
+        total_tokens: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+      },
       data: {
         pagewise_line_items: finalParsed.pagewise_line_items,
         total_item_count: finalParsed.total_item_count || 0,
@@ -125,6 +176,7 @@ app.post("/extract-bill-data", async (req, res) => {
     });
   } catch (err) {
     console.error("ERROR:", err);
+
     return res.status(500).json({
       is_success: false,
       error: err.message || String(err),
@@ -132,7 +184,11 @@ app.post("/extract-bill-data", async (req, res) => {
   }
 });
 
+/*********************** START SERVER *************************/
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+
+
 
 
 
@@ -150,146 +206,141 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // import fs from "fs";
 
 // import { connectDB } from "./src/config/db.js";
-// import { downloadFile, uploadToS3 } from "./src/services/fileService.js";
-
-// // Textract + fallback
-// import { callTextract } from "./src/ocr/textract.js";
-// import { tesseractOCR } from "./src/ocr/tesseractFallback.js";
-
-// // Parsing logic
-// import { parseTextractResponse } from "./src/parser/parseTextract.js";
-// import { detectTotalsAndDedupe } from "./src/parser/detectTotals.js";
+// import { downloadFile } from "./src/services/fileService.js";
+// import { ocrFromImage } from "./src/ocr/tesseractFallback.js";
+// import { extractJsonFromOcr } from "./src/parser/llmExtractor.js";
 
 // dotenv.config();
 
-// // ---------- FIX: Correct Windows-safe __dirname ----------
-// const __dirname = path.resolve();
 
-// // ---------------------------------------------------------
+// let __dirname = path.dirname(decodeURI(new URL(import.meta.url).pathname));
+// if (process.platform === "win32" && __dirname.startsWith("/")) {
+//   __dirname = __dirname.slice(1);
+// }
 
 // const app = express();
-// app.use(bodyParser.json({ limit: "10mb" }));
+// app.use(bodyParser.json({ limit: "15mb" }));
 
 // const PORT = process.env.PORT || 3000;
 
-// // ---------- MongoDB Connection ----------
+// // Mongo client
 // let db;
-// connectDB().then((client) => {
-//   db = client.db(process.env.DB_NAME);
-//   console.log("MongoDB connected");
-// });
+// connectDB()
+//   .then((client) => {
+//     db = client.db(process.env.DB_NAME || "invoice_extractor");
+//     console.log("MongoDB connected");
+//   })
+//   .catch((err) => {
+//     console.error("MongoDB connection failed", err);
+//   });
 
-// /**
-//  * ================================================
-//  *           POST /extract-bill-data
-//  * ================================================
-//  */
+//   //route
 // app.post("/extract-bill-data", async (req, res) => {
 //   try {
 //     const { document } = req.body;
+//     if (!document) return res.status(400).json({ error: "document URL required" });
 
-//     if (!document) {
-//       return res.status(400).json({ error: "document URL required" });
+//     if (!db) {
+//       return res
+//         .status(500)
+//         .json({ is_success: false, error: "DB not connected yet. Try again." });
 //     }
 
-//     // Job ID
 //     const jobId = uuidv4();
+//     const tmpDir = path.join(__dirname, "tmp");
 
-//     // ---------- FIX: Correct tmp directory creation ----------
-//     const tmpPath = path.join(__dirname, "tmp");
-//     if (!fs.existsSync(tmpPath)) {
-//       fs.mkdirSync(tmpPath, { recursive: true });
-//     }
-//     // ---------------------------------------------------------
+    
+//     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-//     const localFile = path.join(tmpPath, `${jobId}.png`);
-
+//     const tmpFile = path.join(tmpDir, `${jobId}.png`);
 //     const invoices = db.collection("invoices");
 
-//     // Create job entry
+    
 //     const job = {
 //       job_id: jobId,
 //       input_url: document,
 //       status: "processing",
 //       created_at: new Date(),
 //     };
-
 //     const inserted = await invoices.insertOne(job);
 
-//     // Download file
-//     await downloadFile(document, localFile);
+//     // download invoice
+//     await downloadFile(document, tmpFile);
 
-//     // Optional S3 upload
-//     if (process.env.S3_BUCKET) {
-//       const key = `uploads/${jobId}.png`;
-//       const s3path = await uploadToS3(localFile, process.env.S3_BUCKET, key);
-
+//     // ---- OCR step (Tesseract) ----
+//     let ocrText;
+//     try {
+//       ocrText = await ocrFromImage(tmpFile);
+//     } catch (err) {
+//       console.error("OCR failed:", err);
 //       await invoices.updateOne(
 //         { _id: inserted.insertedId },
-//         { $set: { s3_path: s3path } }
+//         { $set: { status: "error", error: "OCR failed", updated_at: new Date() } }
 //       );
+//       fs.unlinkSync(tmpFile);
+//       return res.status(500).json({ is_success: false, error: "OCR failed" });
 //     }
 
-//     // ---------------- OCR PROCESS ----------------
-//     let rawOcr = null;
+//     // store raw OCR text
+//     await invoices.updateOne(
+//       { _id: inserted.insertedId },
+//       { $set: { raw_ocr_text: ocrText } }
+//     );
 
+//     // ---- LLM extraction step (structured JSON) ----
+//     let finalParsed;
 //     try {
-//       rawOcr = await callTextract(localFile);
+//       finalParsed = await extractJsonFromOcr(ocrText);
 //     } catch (err) {
-//       console.log("Textract failed → using Tesseract fallback");
-//       rawOcr = await tesseractOCR(localFile);
+//       console.error("LLM extractor failed:", err);
+//       await invoices.updateOne(
+//         { _id: inserted.insertedId },
+//         { $set: { status: "error", error: "LLM extraction failed", updated_at: new Date() } }
+//       );
+//       fs.unlinkSync(tmpFile);
+//       return res.status(500).json({ is_success: false, error: "LLM extraction failed" });
 //     }
 
-//     // Store raw OCR
+//     // update DB
 //     await invoices.updateOne(
 //       { _id: inserted.insertedId },
-//       { $set: { raw_ocr: rawOcr } }
+//       { $set: { ...finalParsed, status: "done", updated_at: new Date() } }
 //     );
 
-//     // Parse extracted text
-//     const parsedPages = parseTextractResponse(rawOcr);
+//     // clean up local file
+//     try {
+//       fs.unlinkSync(tmpFile);
+//     } catch (e) {
+//       // ignore
+//     }
 
-//     // Detect totals & remove duplicates
-//     const finalParsed = detectTotalsAndDedupe(parsedPages);
-
-//     // Update DB
-//     await invoices.updateOne(
-//       { _id: inserted.insertedId },
-//       {
-//         $set: {
-//           ...finalParsed,
-//           status: "done",
-//           updated_at: new Date(),
-//         },
-//       }
-//     );
-
-//     // API Response
+//     // final API response
 //     return res.json({
 //       is_success: true,
-//       token_usage: {
-//         total_tokens: 0,
-//         input_tokens: 0,
-//         output_tokens: 0,
-//       },
+//       token_usage: finalParsed.token_usage || { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
 //       data: {
 //         pagewise_line_items: finalParsed.pagewise_line_items,
-//         total_item_count: finalParsed.total_item_count,
+//         total_item_count: finalParsed.total_item_count || 0,
 //       },
 //     });
 //   } catch (err) {
-//     console.error("SERVER ERROR:", err.message);
+//     console.error("ERROR:", err);
 //     return res.status(500).json({
 //       is_success: false,
-//       error: err.message,
+//       error: err.message || String(err),
 //     });
 //   }
 // });
 
-// // ---------- Start server ----------
-// app.listen(PORT, () => {
-//   console.log(`Server running on port ${PORT}`);
-// });
+// app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+
+
+
+
+
+
+
 
 
 
