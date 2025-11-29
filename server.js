@@ -1,3 +1,10 @@
+
+
+
+
+
+
+//pdf only true text
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
@@ -5,9 +12,9 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs";
 import sharp from "sharp";
-import { convertPdfToPng } from "./src/services/pdfService.js";
-import { downloadFile } from "./src/services/fileService.js";
 
+import { downloadFile } from "./src/services/fileService.js";
+import { extractTextFromPdf } from "./src/services/pdfService.js"; // UPDATED
 import { connectDB } from "./src/config/db.js";
 import { ocrFromImage } from "./src/ocr/tesseractFallback.js";
 import { extractJsonFromOcr } from "./src/parser/llmExtractor.js";
@@ -51,10 +58,9 @@ app.post("/extract-bill-data", async (req, res) => {
 
     const jobId = uuidv4();
     const tmpDir = path.join(__dirname, "tmp");
-
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-    // Base temporary path (extension added by service)
+    // Base temporary path
     const baseTempPath = path.join(tmpDir, jobId);
 
     /***** Step 1: Download file (Auto detect: PDF / Image) ******/
@@ -64,8 +70,6 @@ app.post("/extract-bill-data", async (req, res) => {
     );
 
     const isPdf = ext === ".pdf";
-
-    let finalImagePath = "";
 
     /**************** DB JOB ENTRY ******************/
     const invoices = db.collection("invoices");
@@ -78,40 +82,27 @@ app.post("/extract-bill-data", async (req, res) => {
     };
     const inserted = await invoices.insertOne(job);
 
-    /**************** STEP 2: Convert PDF → PNG or Normalize Image ******************/
+    let ocrText = "";
+
+    /**************** STEP 2: OCR OR DIRECT PDF TEXT ******************/
     if (isPdf) {
-      console.log("PDF detected → converting to PNG...");
-      finalImagePath = await convertPdfToPng(downloadedFile);
+      console.log("PDF detected → extracting text (no OCR required)");
+      ocrText = await extractTextFromPdf(downloadedFile);
     } else {
       console.log("Image detected → normalizing to PNG...");
+      const finalImagePath = baseTempPath + "_converted.png";
 
-      // Save as different PNG file to avoid same input/output
-      const tempPng = baseTempPath + "_converted.png";
+      await sharp(downloadedFile).png().toFile(finalImagePath);
 
-      await sharp(downloadedFile).png().toFile(tempPng);
+      console.log("Running OCR on image...");
+      ocrText = await ocrFromImage(finalImagePath);
 
-      finalImagePath = tempPng;
+      // Cleanup image
+      if (fs.existsSync(finalImagePath)) fs.unlinkSync(finalImagePath);
     }
 
-    /**************** STEP 3: OCR ******************/
-    let ocrText;
-    try {
-      ocrText = await ocrFromImage(finalImagePath);
-    } catch (err) {
-      console.error("OCR failed:", err);
-
-      await invoices.updateOne(
-        { _id: inserted.insertedId },
-        {
-          $set: {
-            status: "error",
-            error: "OCR failed",
-            updated_at: new Date(),
-          },
-        }
-      );
-
-      return res.status(500).json({ is_success: false, error: "OCR failed" });
+    if (!ocrText || ocrText.trim().length === 0) {
+      throw new Error("Extraction returned empty text");
     }
 
     await invoices.updateOne(
@@ -119,7 +110,7 @@ app.post("/extract-bill-data", async (req, res) => {
       { $set: { raw_ocr_text: ocrText } }
     );
 
-    /**************** STEP 4: LLM JSON parsing ******************/
+    /**************** STEP 3: LLM JSON parsing ******************/
     let finalParsed;
     try {
       finalParsed = await extractJsonFromOcr(ocrText);
@@ -143,7 +134,7 @@ app.post("/extract-bill-data", async (req, res) => {
       });
     }
 
-    /**************** STEP 5: Save Result ******************/
+    /**************** STEP 4: Save Result ******************/
     await invoices.updateOne(
       { _id: inserted.insertedId },
       {
@@ -158,7 +149,6 @@ app.post("/extract-bill-data", async (req, res) => {
     /**************** CLEANUP ******************/
     try {
       if (fs.existsSync(downloadedFile)) fs.unlinkSync(downloadedFile);
-      if (fs.existsSync(finalImagePath)) fs.unlinkSync(finalImagePath);
     } catch {}
 
     /**************** FINAL RESPONSE ******************/
@@ -186,6 +176,7 @@ app.post("/extract-bill-data", async (req, res) => {
 
 /*********************** START SERVER *************************/
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
 
 
